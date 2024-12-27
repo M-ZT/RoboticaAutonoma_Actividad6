@@ -1,3 +1,4 @@
+/*
 #include "control.h"
 
 #include <time.h>
@@ -108,6 +109,213 @@ void Control::goalDone(ArPose pose)
     oldPose = pose;
     myGoalDone = true;
     generateRandomPose();
+}
+
+void Control::goalFailed(ArPose pose)
+{
+    QString sPose = QString("Goal(%1, %2, %3) failed").
+            arg(pose.getX()).arg(pose.getY()).arg(pose.getTh());
+    ArLog::log(ArLog::Normal, "Control: goalFailed: %s", sPose.toLatin1().data());
+
+    // Grabado datos
+    out << sPose << "\n";
+    out.flush();
+
+    // esta función está como ejemplo de cómo llamar a CommandFunctions
+    // en execute() desconectando las acciones, p. ej. llamamos a escape()
+
+    // escape();
+
+    myGoalDone = true;
+    generateRandomPose();
+}
+
+void Control::goalInterrupt(ArPose pose)
+{
+    QString sPose = QString("Goal(%1, %2, %3) failed").
+            arg(pose.getX()).arg(pose.getY()).arg(pose.getTh());
+    ArLog::log(ArLog::Normal, "Control: goalInterrupt: %s", sPose.toLatin1().data());
+    // TODO
+}
+
+void Control::generateRandomPose()
+{
+    // Solo para pruebas
+    ArPose poseMin = myPathTask->getAriaMap()->getLineMinPose();
+    ArPose poseMax = myPathTask->getAriaMap()->getLineMaxPose();
+    int ancho = int(poseMax.getX() - poseMin.getX());
+    int alto = int(poseMax.getY() - poseMin.getY());
+    newPose.setX(poseMin.getX() + rand() % ancho);
+    newPose.setY(poseMin.getY() + rand() % alto);
+    newPose.setTh(rand() % 360);
+}
+
+// This function is called whenever the path planning task changes its state
+// (for example, from idle to planning a path, to following a planned path).
+void Control::pathPlanStateChanged()
+{
+    char s[256];
+    myPathTask->getFailureString(s, 256);
+    ArLog::log(ArLog::Normal, "Control: Path planning state: %s", s);
+    // TODO
+}
+
+void Control::locFailed(int n) // Número de veces que ha fallado la localización
+{
+    // Si se llega aquí no hay nada que hacer, sino empezar de nuevo el experimento
+    ArLog::log(ArLog::Normal, "Control: Localization failed: %d", n);
+}
+
+
+
+*/
+#include "control.h"
+#include <QFile>
+#include <QTextStream>
+#include <vector>
+
+Control::Control(ArRobot *robot, ArPathPlanningTask *pathTask, ArLocalizationTask *locTask) 
+    : myTaskCB(this, &Control::execute),
+      myGoalDoneCB(this, &Control::goalDone),
+      myGoalFailedCB(this, &Control::goalFailed),
+      myGoalInterruptCB(this, &Control::goalInterrupt),
+      pathPlanStateChangedCB(this, &Control::pathPlanStateChanged),
+      locFailedCB(this, &Control::locFailed)
+{
+    myRobot = robot;
+    myPathTask = pathTask;
+    myLocTask = locTask;
+
+    // trigger the first start off
+    myGoalDone = true;
+    // This is an example of a user task callback. This is called every ArRobot
+    // task cycle (every 100ms). The function is defined below.
+
+    myRobot->addUserTask("controlTask", 50, &myTaskCB);
+    // Estas funciones están en ArPathPlanningInterface.h
+
+    myPathTask->addGoalDoneCB(&myGoalDoneCB);
+    myPathTask->addGoalFailedCB(&myGoalFailedCB);
+    myPathTask->addGoalInterruptedCB(&myGoalInterruptCB);
+    myPathTask->addStateChangeCB(&pathPlanStateChangedCB);
+    myLocTask->addFailedLocalizationCB(&locFailedCB);
+
+    srand(time(NULL));// usar srand(1) si se quiere la misma serie
+                       // de aleatorios siempre
+
+    // para guardar datos
+    file.setFileName("goalsLog.txt");
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        out.setDevice(&file);
+    }
+
+    // Inicialización del grid
+    initializeGrid();
+
+    // Intentar cargar la ruta desde un archivo
+    if (loadRouteFromFile()) {
+        followingStoredRoute = true;
+    } else {
+        followingStoredRoute = false;
+        currentCell = {0, 0};
+    }
+}
+
+void Control::initializeGrid() {
+    // Crear una rejilla según las dimensiones del mapa
+    ArPose poseMin = myPathTask->getAriaMap()->getLineMinPose();
+    ArPose poseMax = myPathTask->getAriaMap()->getLineMaxPose();
+    int rows = (poseMax.getY() - poseMin.getY()) / CELL_SIZE;
+    int cols = (poseMax.getX() - poseMin.getX()) / CELL_SIZE;
+    grid.resize(rows, std::vector<bool>(cols, false));
+}
+
+void Control::execute() {
+    if (!myGoalDone) 
+    return;
+
+    if (followingStoredRoute) {
+        followStoredRoute();
+    } else {
+        exploreGrid();
+    }
+}
+
+void Control::exploreGrid() {
+    if (currentCell.first >= grid.size()) {
+        saveRouteToFile();
+        return;
+    }
+
+    ArPose targetPose = calculatePoseFromCell(currentCell);
+    if (isReachable(targetPose)) {
+        myGoalDone = false;
+        myPathTask->pathPlanToPose(targetPose, false);
+    } else {
+        moveToNextCell();
+    }
+}
+
+ArPose Control::calculatePoseFromCell(std::pair<int, int> cell) {
+    ArPose poseMin = myPathTask->getAriaMap()->getLineMinPose();
+    return ArPose(
+        poseMin.getX() + cell.second * CELL_SIZE,
+        poseMin.getY() + cell.first * CELL_SIZE,
+        0
+    );
+}
+
+void Control::moveToNextCell() {
+    currentCell.second++;
+    if (currentCell.second >= grid[0].size()) {
+        currentCell.second = 0;
+        currentCell.first++;
+    }
+}
+
+bool Control::isReachable(ArPose pose) {
+    return myPathTask->checkPathPlanningRequirements(pose);
+}
+
+control::~Control()
+{
+    file.close();
+}
+void Control::goalDone(ArPose pose) {
+    grid[currentCell.first][currentCell.second] = true;
+    moveToNextCell();
+    myGoalDone = true;
+}
+
+void Control::saveRouteToFile() {
+    QFile routeFile("route.txt");
+    if (routeFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QTextStream out(&routeFile);
+        for (const auto &row : grid) {
+            for (bool cell : row) {
+                out << (cell ? "1 " : "0 ");
+            }
+            out << "\n";
+        }
+    }
+}
+
+bool Control::loadRouteFromFile() {
+    QFile routeFile("route.txt");
+    if (!routeFile.exists()) return false;
+
+    if (routeFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&routeFile);
+        for (int i = 0; i < grid.size(); ++i) {
+            for (int j = 0; j < grid[i].size(); ++j) {
+                int value;
+                in >> value;
+                grid[i][j] = (value == 1);
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 void Control::goalFailed(ArPose pose)
